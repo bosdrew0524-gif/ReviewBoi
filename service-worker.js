@@ -5,7 +5,7 @@
    so returning users get the update instead of a stale cache.
    ============================================================ */
 
-const CACHE_NAME = "studydesk-cache-v2";
+const CACHE_NAME = "studydesk-cache-v3";
 
 const APP_SHELL = [
   "./",
