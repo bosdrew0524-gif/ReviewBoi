@@ -1,0 +1,25 @@
+{
+  "name": "Studydesk — AI Study Reviewer",
+  "short_name": "Studydesk",
+  "description": "Create subjects, upload study materials, and generate summaries and quizzes — all saved locally on your device.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#F6F4EE",
+  "theme_color": "#1B2431",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

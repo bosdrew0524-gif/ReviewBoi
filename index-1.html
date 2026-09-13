@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Studydesk — Your Study Reviewer</title>
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1B2431">
+<link rel="icon" href="favicon-32.png" sizes="32x32">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Studydesk">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">Sd</div>
+      <div class="brand-text">
+        <span class="brand-name">Studydesk</span>
+        <span class="brand-tag">your reviewer, organized</span>
+      </div>
+      <button class="sidebar-close" id="sidebarClose" aria-label="Close menu">✕</button>
+    </div>
+
+    <button class="nav-item" id="navDashboard" data-active="true">
+      <span class="nav-icon">⌂</span> Dashboard
+    </button>
+
+    <div class="sidebar-section-label">Your subjects</div>
+    <div class="subject-list" id="subjectList"><!-- injected --></div>
+
+    <button class="create-subject-btn" id="openCreateSubject">
+      <span class="plus">+</span> Create subject
+    </button>
+
+    <div class="sidebar-footer">
+      <p>Data lives only in this browser.<br>No account, no server.</p>
+    </div>
+  </aside>
+
+  <div class="sidebar-scrim" id="sidebarScrim"></div>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+    <header class="topbar">
+      <button class="menu-btn" id="menuBtn" aria-label="Open menu">☰</button>
+      <h1 class="page-title" id="pageTitle">Dashboard</h1>
+      <div class="topbar-spacer"></div>
+    </header>
+
+    <div class="view" id="view"><!-- injected per page --></div>
+  </main>
+</div>
+
+<!-- ============ MODAL: Create / Rename Subject ============ -->
+<div class="modal-overlay" id="subjectModalOverlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2 id="subjectModalTitle">Create subject</h2>
+    <p class="modal-sub">Give it a name you'll recognize at a glance.</p>
+    <input type="text" id="subjectNameInput" class="text-input" placeholder="e.g. Networking" maxlength="40">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="subjectModalCancel">Cancel</button>
+      <button class="btn btn-primary" id="subjectModalConfirm">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Delete confirm ============ -->
+<div class="modal-overlay" id="deleteModalOverlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2>Delete subject?</h2>
+    <p class="modal-sub" id="deleteModalText">This removes all materials, summaries, and quiz history inside it. This can't be undone.</p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="deleteModalCancel">Cancel</button>
+      <button class="btn btn-danger" id="deleteModalConfirm">Delete permanently</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Paste text material ============ -->
+<div class="modal-overlay" id="pasteModalOverlay">
+  <div class="modal modal-wide" role="dialog" aria-modal="true">
+    <h2>Paste study text</h2>
+    <p class="modal-sub">Drop in notes, a passage, or anything you want reviewed.</p>
+    <input type="text" id="pasteTitleInput" class="text-input" placeholder="Title (e.g. Chapter 4 notes)" maxlength="60">
+    <textarea id="pasteTextInput" class="textarea-input" placeholder="Paste your text here..."></textarea>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="pasteModalCancel">Cancel</button>
+      <button class="btn btn-primary" id="pasteModalConfirm">Add material</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Quiz setup ============ -->
+<div class="modal-overlay" id="quizSetupOverlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2>Generate a quiz</h2>
+    <p class="modal-sub">Based on this subject's study materials.</p>
+
+    <label class="field-label">Number of questions</label>
+    <input type="range" id="quizCountInput" min="3" max="15" value="5" class="range-input">
+    <div class="range-value"><span id="quizCountValue">5</span> questions</div>
+
+    <label class="field-label">Difficulty</label>
+    <div class="segmented" id="difficultySeg">
+      <button class="seg-btn" data-diff="easy">Easy</button>
+      <button class="seg-btn active" data-diff="medium">Medium</button>
+      <button class="seg-btn" data-diff="hard">Hard</button>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="quizSetupCancel">Cancel</button>
+      <button class="btn btn-primary" id="quizSetupConfirm">Generate quiz</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="script.js"></script>
+<script>
+  // Register the service worker so the app shell is cached for offline use.
+  if("serviceWorker" in navigator){
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("service-worker.js").catch(err => {
+        console.warn("Service worker registration failed:", err);
+      });
+    });
+  }
+</script>
+</body>
+</html>
