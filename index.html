@@ -120,6 +120,8 @@
       <button class="seg-btn" data-diff="hard">Hard</button>
     </div>
 
+    <p class="modal-sub" id="quizCorpusNotice" style="display:none;margin-top:14px;"></p>
+
     <div class="modal-actions">
       <button class="btn btn-ghost" id="quizSetupCancel">Cancel</button>
       <button class="btn btn-primary" id="quizSetupConfirm">Generate quiz</button>
@@ -129,6 +131,9 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- Client-side text extraction for uploaded PDF / DOCX files -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <script src="script.js"></script>
 <script>
   // Register the service worker so the app shell is cached for offline use.
