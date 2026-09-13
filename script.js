@@ -99,13 +99,39 @@ function makeSubject(name, color){
   };
 }
 
-function makeMaterial(title, type, extractedText){
+/* ---------------- PDF / DOCX text extraction ---------------- */
+// Uses pdf.js and mammoth.js (loaded via <script> tags in index.html) to pull
+// real text out of uploaded files, client-side, no server involved.
+if(window.pdfjsLib){
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+}
+
+async function extractPdfText(file){
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+  let text = "";
+  for(let i = 1; i <= pdf.numPages; i++){
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map(it => it.str).join(" ") + "\n";
+  }
+  return text.trim();
+}
+
+async function extractDocxText(file){
+  const buffer = await file.arrayBuffer();
+  const result = await mammoth.extractRawText({ arrayBuffer: buffer });
+  return (result.value || "").trim();
+}
+
+function makeMaterial(title, type, extractedText, status){
   return {
     id: uid(),
     title: title,
     type: type,        // 'text' | 'txt' | 'pdf' | 'docx'
     addedAt: Date.now(),
-    text: extractedText || ""
+    text: extractedText || "",
+    status: status || "ready"   // 'ready' | 'processing' | 'error'
   };
 }
 
@@ -523,16 +549,29 @@ function renderMaterialsPanel(subj){
     return;
   }
   const icons = { text:"📝", txt:"📄", pdf:"📕", docx:"📘" };
-  list.innerHTML = subj.materials.map(m => `
+  list.innerHTML = subj.materials.map(m => {
+    let metaLine;
+    if(m.status === "processing"){
+      metaLine = `${m.type.toUpperCase()} · extracting text…`;
+    } else if(m.status === "error"){
+      metaLine = `${m.type.toUpperCase()} · couldn't extract text — try pasting it instead`;
+    } else if(m.status === "empty"){
+      metaLine = `${m.type.toUpperCase()} · added ${timeAgo(m.addedAt)} · no readable text found (likely a scanned/image file)`;
+    } else {
+      metaLine = `${m.type.toUpperCase()} · added ${timeAgo(m.addedAt)} · ${m.text.length} characters`;
+    }
+    const warn = (m.status === "error" || m.status === "empty");
+    return `
     <div class="material-card">
-      <div class="material-icon">${icons[m.type] || "📄"}</div>
+      <div class="material-icon">${m.status === "processing" ? "⏳" : icons[m.type] || "📄"}</div>
       <div class="material-info">
         <div class="m-name">${escapeHtml(m.title)}</div>
-        <div class="m-meta">${m.type.toUpperCase()} · added ${timeAgo(m.addedAt)} · ${m.text.length} characters</div>
+        <div class="m-meta" style="${warn ? 'color:var(--red)':''}">${metaLine}</div>
       </div>
       <button class="icon-btn" data-id="${m.id}" title="Delete material">🗑</button>
     </div>
-  `).join("");
+  `;
+  }).join("");
   list.querySelectorAll(".icon-btn").forEach(btn => {
     btn.addEventListener("click", () => {
       subj.materials = subj.materials.filter(m => m.id !== btn.dataset.id);
@@ -558,18 +597,37 @@ function handleFiles(fileList, subj){
         renderAll(); renderSubjectPage();
       };
       reader.readAsText(file);
-    } else {
-      // PDF/DOCX: real text extraction needs a parsing library or backend.
-      // We store the file's metadata now and a placeholder note, so summaries
-      // and quizzes still have something to work with. Swap this in the AI
-      // HOOK section once a real parser/API is connected.
-      const placeholder = `This is "${file.name}", a ${ext.toUpperCase()} file. Full text extraction requires ` +
-        `a parsing library or backend, so for now this material has no extracted text. You can paste its ` +
-        `key content manually to get a real AI summary and quiz.`;
-      subj.materials.push(makeMaterial(file.name, ext, ""));
-      showToast(`Added "${file.name}" (paste its text for full AI features)`);
-      renderAll(); renderSubjectPage();
+      return;
     }
+
+    // PDF / DOCX: show it right away as "processing", then extract real text
+    // in the background with pdf.js / mammoth.js and fill it in once done.
+    const material = makeMaterial(file.name, ext, "", "processing");
+    subj.materials.push(material);
+    renderAll(); renderSubjectPage();
+
+    const extractor = ext === "pdf" ? extractPdfText : extractDocxText;
+    const libAvailable = ext === "pdf" ? !!window.pdfjsLib : !!window.mammoth;
+
+    if(!libAvailable){
+      material.status = "error";
+      material.text = "";
+      showToast(`Couldn't load the ${ext.toUpperCase()} reader — check your connection and try again.`);
+      renderAll(); renderSubjectPage();
+      return;
+    }
+
+    extractor(file).then(text => {
+      material.text = text;
+      material.status = text.length > 0 ? "ready" : "empty";
+      showToast(`Extracted text from "${file.name}"`);
+      renderAll(); renderSubjectPage();
+    }).catch(err => {
+      console.warn("Extraction failed:", err);
+      material.status = "error";
+      showToast(`Couldn't read "${file.name}" — try pasting its text instead.`);
+      renderAll(); renderSubjectPage();
+    });
   });
 }
 
@@ -854,6 +912,21 @@ function openQuizSetupModal(){
   document.querySelectorAll("#difficultySeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.diff==="medium"));
   document.getElementById("quizCountInput").value = 5;
   document.getElementById("quizCountValue").textContent = 5;
+
+  const subj = activeSubject();
+  const corpus = subj ? getSubjectCorpus(subj) : "";
+  const notice = document.getElementById("quizCorpusNotice");
+  if(corpus.trim().length < 40){
+    notice.style.display = "block";
+    notice.style.color = "var(--amber-dark)";
+    notice.textContent = "No usable material text found yet, so this quiz will use general study-skill questions instead of ones from your notes. Add a .txt file, pasted text, or a PDF/DOCX with readable text to get subject-specific questions.";
+  } else {
+    notice.style.display = "block";
+    notice.style.color = "var(--ink-soft)";
+    const words = corpus.trim().split(/\s+/).length;
+    notice.textContent = `Drawing from about ${words} words of material across this subject.`;
+  }
+
   document.getElementById("quizSetupOverlay").classList.add("open");
 }
 function closeQuizSetupModal(){
