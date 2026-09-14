@@ -47,6 +47,10 @@ function loadState(){
   try{
     const parsed = JSON.parse(raw);
     state.subjects = parsed.subjects || [];
+    state.subjects.forEach(s => {
+      if(s.aiSummary === undefined) s.aiSummary = null;
+      (s.materials || []).forEach(m => { if(m.status === undefined) m.status = "ready"; });
+    });
     state.activeSubjectId = parsed.activeSubjectId || (state.subjects[0] && state.subjects[0].id) || null;
   }catch(e){
     console.warn("Corrupt saved data, starting fresh", e);
@@ -95,7 +99,8 @@ function makeSubject(name, color){
     color: color || SWATCHES[state.subjects.length % SWATCHES.length],
     createdAt: Date.now(),
     materials: [],
-    quizHistory: []
+    quizHistory: [],
+    aiSummary: null   // cached generated {simple,keyPoints,keywords,definitions,reviewer,source}
   };
 }
 
@@ -185,6 +190,35 @@ function getSubjectCorpus(subject){
   return subject.materials.map(m => m.text).filter(Boolean).join(" ");
 }
 
+// Sentences grouped by material, so summaries/quizzes can draw from every
+// material instead of only the first one in the concatenated corpus.
+function getMaterialSentenceGroups(subject){
+  return subject.materials
+    .filter(m => m.text)
+    .map(m => ({ material: m, sentences: splitSentences(m.text) }))
+    .filter(g => g.sentences.length > 0);
+}
+
+// Pulls sentences round-robin across materials (1 from each, then repeat)
+// so every uploaded material is represented, not just whichever was added first.
+function roundRobinSentences(groups, count){
+  const picked = [];
+  const cursors = groups.map(() => 0);
+  let round = 0;
+  while(picked.length < count && groups.some((g,i) => cursors[i] < g.sentences.length)){
+    for(let i = 0; i < groups.length && picked.length < count; i++){
+      const g = groups[i];
+      if(cursors[i] < g.sentences.length){
+        picked.push(g.sentences[cursors[i]]);
+        cursors[i]++;
+      }
+    }
+    round++;
+    if(round > 50) break; // safety valve
+  }
+  return picked;
+}
+
 function extractKeywords(text, limit){
   limit = limit || 8;
   const freq = {};
@@ -206,54 +240,90 @@ function splitSentences(text){
     .filter(s => s.length > 12);
 }
 
-// AI HOOK: swap for a real summarization call.
-function generateSummary(subject){
+// Grabs a short window of words around a keyword's occurrence in a sentence,
+// instead of quoting the entire sentence — shorter, and more "definition"-shaped.
+function extractSnippet(sentence, keyword, windowSize){
+  windowSize = windowSize || 9;
+  const words = sentence.split(/\s+/);
+  const idx = words.findIndex(w => w.toLowerCase().replace(/[^a-z-]/g,"") === keyword);
+  if(idx === -1) return truncate(sentence, 140);
+  const start = Math.max(0, idx - windowSize);
+  const end = Math.min(words.length, idx + windowSize + 1);
+  let snippet = words.slice(start, end).join(" ");
+  if(start > 0) snippet = "…" + snippet;
+  if(end < words.length) snippet = snippet + "…";
+  return snippet;
+}
+
+// Replaces the keyword itself with a blank, so the quiz actually tests recall
+// instead of quoting the answer back at the person.
+function maskTerm(snippet, keyword){
+  const re = new RegExp(`\\b${keyword}\\w*\\b`, "gi");
+  return snippet.replace(re, "_____");
+}
+
+// AI HOOK: swap for a real summarization call. (This is the offline fallback —
+// see local-ai.js for the on-device model path, wired in via triggerSummaryGeneration below.)
+function generateSummaryMock(subject){
   const text = getSubjectCorpus(subject);
   if(!text) return null;
-  const sentences = splitSentences(text);
-  const simple = sentences.slice(0, 2).join(" ") || text.slice(0,220);
-  const keyPoints = sentences.slice(0, Math.min(6, sentences.length));
+
+  const groups = getMaterialSentenceGroups(subject);
+  const orderedSentences = roundRobinSentences(groups, 24); // draws from every material
+
+  const simple = orderedSentences.slice(0, groups.length || 1).slice(0,3).join(" ") ||
+    orderedSentences.slice(0,2).join(" ") || text.slice(0,220);
+  const keyPoints = orderedSentences.slice(0, Math.min(6, orderedSentences.length));
   const keywords = extractKeywords(text, 8);
   const definitions = keywords.slice(0, 4).map(k => {
-    const sentence = sentences.find(s => s.toLowerCase().includes(k)) ||
+    const sentence = orderedSentences.find(s => s.toLowerCase().includes(k)) ||
       `${capitalize(k)} is a key concept covered in this subject's materials.`;
-    return { term: capitalize(k), def: sentence };
+    return { term: capitalize(k), def: extractSnippet(sentence, k, 12) };
   });
   const reviewer = keyPoints.map((s,i) => `${i+1}. ${s}`).join("\n");
 
-  return { simple, keyPoints, keywords, definitions, reviewer, generatedAt: Date.now() };
+  return { simple, keyPoints, keywords, definitions, reviewer, generatedAt: Date.now(), source: "mock" };
 }
 
 function capitalize(w){ return w.charAt(0).toUpperCase() + w.slice(1); }
 
-// AI HOOK: swap for a real quiz-generation call.
-function generateQuiz(subject, count, difficulty){
+// AI HOOK: swap for a real quiz-generation call. (Offline fallback — see
+// local-ai.js for the on-device model path.)
+// Question format: the definition/context is the QUESTION, the term is the
+// ANSWER — a fill-in-the-blank / "what term does this describe" style,
+// rather than quoting a whole sentence back with the term visible in it.
+function generateQuizMock(subject, count, difficulty){
   const text = getSubjectCorpus(subject);
-  const sentences = splitSentences(text);
-  const keywords = extractKeywords(text, 20);
+  const groups = getMaterialSentenceGroups(subject);
+  const sentences = roundRobinSentences(groups, 60);
+  const keywords = extractKeywords(text, 24);
   const questions = [];
 
   const genericBank = genericQuestionBank(subject.name, difficulty);
 
-  // Build fact-based questions from sentences containing a keyword.
-  const usedSentences = new Set();
+  const usedKeywords = new Set();
   for(const kw of keywords){
     if(questions.length >= count) break;
-    const sentence = sentences.find(s => !usedSentences.has(s) && s.toLowerCase().includes(kw));
+    if(usedKeywords.has(kw)) continue;
+    const sentence = sentences.find(s => s.toLowerCase().includes(kw));
     if(!sentence) continue;
-    usedSentences.add(sentence);
+    usedKeywords.add(kw);
+
+    const snippet = extractSnippet(sentence, kw, 10);
+    const masked = maskTerm(snippet, kw);
+    if(!masked.includes("_____")) continue; // masking failed, skip rather than leak the answer
 
     const otherKeywords = keywords.filter(k => k !== kw);
     const distractors = shuffle(otherKeywords).slice(0,3).map(capitalize);
-    while(distractors.length < 3) distractors.push(capitalize(kw) + " variant");
+    while(distractors.length < 3) distractors.push(capitalize(kw) + " (related)");
 
     const options = shuffle([capitalize(kw), ...distractors]);
     questions.push({
       id: uid(),
-      question: `Which term best relates to this idea from your notes: "${truncate(sentence, 130)}"?`,
+      question: `Which term fills in the blank: "${masked}"`,
       options,
       correctIndex: options.indexOf(capitalize(kw)),
-      explanation: `The sentence directly discusses "${kw}", making it the term most closely tied to that idea.`,
+      explanation: `Your notes say: "${truncate(sentence, 150)}" — so "${capitalize(kw)}" is the term being described.`,
       difficulty
     });
   }
@@ -320,6 +390,91 @@ function genericQuestionBank(subjectName, difficulty){
     explanation: item.exp,
     difficulty
   }));
+}
+
+/* ============================================================
+   LOCAL AI INTEGRATION
+   Wraps window.LocalAI (defined in local-ai.js, a WebLLM engine
+   that runs a small model fully on-device). Falls back to the
+   mock functions above whenever local AI is off, unsupported,
+   or fails for any reason — so the app always produces something.
+   ============================================================ */
+function useLocalAI(){
+  return localStorage.getItem("studydesk_use_local_ai") === "1";
+}
+function setUseLocalAI(v){
+  localStorage.setItem("studydesk_use_local_ai", v ? "1" : "0");
+}
+
+// Keeps the cached summary honest when materials change: quick-scan summaries
+// are cheap, so just auto-refresh them; a real on-device AI summary is left
+// alone (regenerating is slow/deliberate) but flagged as stale so the user
+// knows to hit Regenerate if they want the new material folded in.
+function markSummaryStaleOrRegen(subj){
+  if(!subj.aiSummary) return;
+  if(subj.aiSummary.source === "mock"){
+    subj.aiSummary = generateSummaryMock(subj);
+  } else {
+    subj.aiSummary.stale = true;
+  }
+}
+
+async function triggerSummaryGeneration(subj){
+  const corpus = getSubjectCorpus(subj);
+  if(!corpus){
+    subj.aiSummary = null;
+    renderAll(); renderSubjectPage();
+    return;
+  }
+
+  const usingLocal = useLocalAI() && window.LocalAI && window.LocalAI.supported;
+  ["panel-summary","panel-reviewer"].forEach(id => {
+    const el = document.getElementById(id);
+    if(el) el.innerHTML = `<div class="empty-state"><h3>Generating…</h3><p>${
+      usingLocal ? "Thinking with the on-device model — this can take a bit, especially the first time." : "Scanning your materials."
+    }</p></div>`;
+  });
+
+  let result = null;
+  if(usingLocal){
+    try{
+      if(window.LocalAI.status !== "ready") await window.LocalAI.enable();
+      result = await window.LocalAI.summarize(subj.name, corpus);
+    }catch(err){
+      console.warn("Local AI summary failed, falling back to quick-scan:", err);
+      showToast("On-device AI had trouble — used quick-scan instead.");
+    }
+  }
+  if(!result) result = generateSummaryMock(subj);
+
+  subj.aiSummary = result;
+  renderAll(); renderSubjectPage();
+}
+
+async function buildQuizQuestions(subj, count, difficulty){
+  const corpus = getSubjectCorpus(subj);
+  const usingLocal = useLocalAI() && window.LocalAI && window.LocalAI.supported && corpus.trim().length >= 40;
+
+  if(usingLocal){
+    try{
+      if(window.LocalAI.status !== "ready") await window.LocalAI.enable();
+      const raw = await window.LocalAI.generateQuiz(subj.name, corpus, count, difficulty);
+      if(raw && raw.length){
+        return raw.slice(0, count).map(q => ({
+          id: uid(),
+          question: q.question,
+          options: q.options,
+          correctIndex: q.correctIndex,
+          explanation: q.explanation || "Based on your study materials.",
+          difficulty
+        }));
+      }
+    }catch(err){
+      console.warn("Local AI quiz failed, falling back to quick-scan:", err);
+      showToast("On-device AI had trouble — used quick-scan questions instead.");
+    }
+  }
+  return generateQuizMock(subj, count, difficulty);
 }
 
 /* ============================================================
@@ -575,6 +730,7 @@ function renderMaterialsPanel(subj){
   list.querySelectorAll(".icon-btn").forEach(btn => {
     btn.addEventListener("click", () => {
       subj.materials = subj.materials.filter(m => m.id !== btn.dataset.id);
+      markSummaryStaleOrRegen(subj);
       showToast("Material removed.");
       renderAll();
       renderSubjectPage();
@@ -593,6 +749,7 @@ function handleFiles(fileList, subj){
       const reader = new FileReader();
       reader.onload = () => {
         subj.materials.push(makeMaterial(file.name, "txt", String(reader.result)));
+        markSummaryStaleOrRegen(subj);
         showToast(`Added "${file.name}"`);
         renderAll(); renderSubjectPage();
       };
@@ -620,6 +777,7 @@ function handleFiles(fileList, subj){
     extractor(file).then(text => {
       material.text = text;
       material.status = text.length > 0 ? "ready" : "empty";
+      markSummaryStaleOrRegen(subj);
       showToast(`Extracted text from "${file.name}"`);
       renderAll(); renderSubjectPage();
     }).catch(err => {
@@ -634,15 +792,32 @@ function handleFiles(fileList, subj){
 /* ---- Summary panel ---- */
 function renderSummaryPanel(subj){
   const panel = document.getElementById("panel-summary");
-  const data = generateSummary(subj);
+  const corpus = getSubjectCorpus(subj);
 
-  if(!data){
+  if(!corpus){
     panel.innerHTML = `<div class="empty-state"><h3>Nothing to summarize yet</h3><p>Add a study material with extracted text to generate a summary.</p></div>`;
     return;
   }
 
+  const data = subj.aiSummary;
+  if(!data){
+    panel.innerHTML = `
+      <div class="empty-state">
+        <h3>No summary yet</h3>
+        <p>Generate a summary, key points, keywords, and definitions from this subject's materials.</p>
+        <button class="btn btn-primary" id="genSummaryBtn">Generate summary</button>
+      </div>`;
+    document.getElementById("genSummaryBtn").addEventListener("click", () => triggerSummaryGeneration(subj));
+    return;
+  }
+
+  const sourceLabel = data.source === "local-ai" ? "⚡ Generated with on-device AI" : "🔎 Generated with quick-scan (no AI)";
+  const staleNote = data.stale ? " — new material added since this was generated" : "";
   panel.innerHTML = `
-    <div class="notice-banner">✨ Generated from your uploaded materials using sample AI logic — swap in a real model anytime.</div>
+    <div class="notice-banner" style="${data.stale ? 'background:var(--red-tint);border-color:#EFC6BB;color:var(--red);':''}">
+      <span>${sourceLabel}${staleNote}</span>
+      <button class="btn btn-ghost btn-sm" id="regenSummaryBtn" style="margin-left:auto;">Regenerate</button>
+    </div>
     <div class="ai-grid">
       <div class="ai-card">
         <h3><span class="tag-icon" style="background:var(--teal-tint);color:var(--teal-dark)">📄</span>Simple summary</h3>
@@ -662,14 +837,26 @@ function renderSummaryPanel(subj){
       </div>
     </div>
   `;
+  document.getElementById("regenSummaryBtn").addEventListener("click", () => triggerSummaryGeneration(subj));
 }
 
 /* ---- Reviewer panel ---- */
 function renderReviewerPanel(subj){
   const panel = document.getElementById("panel-reviewer");
-  const data = generateSummary(subj);
-  if(!data){
+  const corpus = getSubjectCorpus(subj);
+  if(!corpus){
     panel.innerHTML = `<div class="empty-state"><h3>No reviewer notes yet</h3><p>Add study materials first so notes can be generated.</p></div>`;
+    return;
+  }
+  const data = subj.aiSummary;
+  if(!data){
+    panel.innerHTML = `
+      <div class="empty-state">
+        <h3>No reviewer notes yet</h3>
+        <p>Generate a summary first — reviewer notes come from the same pass.</p>
+        <button class="btn btn-primary" id="genReviewerBtn">Generate now</button>
+      </div>`;
+    document.getElementById("genReviewerBtn").addEventListener("click", () => triggerSummaryGeneration(subj));
     return;
   }
   panel.innerHTML = `
@@ -896,6 +1083,64 @@ function closeDeleteModal(){
   pendingDeleteId = null;
 }
 
+/* ---------------- Backup / restore ---------------- */
+function exportBackup(){
+  const payload = {
+    app: "studydesk",
+    version: 1,
+    exportedAt: Date.now(),
+    subjects: state.subjects,
+    activeSubjectId: state.activeSubjectId,
+    useLocalAI: useLocalAI()
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const stamp = new Date().toISOString().slice(0,10);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `studydesk-backup-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showToast("Backup downloaded.");
+}
+
+function importBackupFile(file){
+  const reader = new FileReader();
+  reader.onload = () => {
+    let parsed;
+    try{
+      parsed = JSON.parse(String(reader.result));
+    }catch(err){
+      showToast("That file isn't valid JSON.");
+      return;
+    }
+    if(!parsed || !Array.isArray(parsed.subjects)){
+      showToast("That file doesn't look like a Studydesk backup.");
+      return;
+    }
+    const ok = confirm(
+      `This will replace everything currently saved with ${parsed.subjects.length} subject(s) from the backup. This can't be undone. Continue?`
+    );
+    if(!ok) return;
+
+    state.subjects = parsed.subjects;
+    state.subjects.forEach(s => {
+      if(s.aiSummary === undefined) s.aiSummary = null;
+      (s.materials || []).forEach(m => { if(m.status === undefined) m.status = "ready"; });
+    });
+    state.activeSubjectId = parsed.activeSubjectId || (state.subjects[0] && state.subjects[0].id) || null;
+    state.activePage = "dashboard";
+    if(typeof parsed.useLocalAI === "boolean") setUseLocalAI(parsed.useLocalAI);
+
+    document.getElementById("backupModalOverlay").classList.remove("open");
+    showToast("Backup restored.");
+    renderAll();
+  };
+  reader.readAsText(file);
+}
+
 function openPasteModal(){
   document.getElementById("pasteTitleInput").value = "";
   document.getElementById("pasteTextInput").value = "";
@@ -1000,6 +1245,7 @@ function wireGlobalEvents(){
     if(!text){ showToast("Paste some text first."); return; }
     const subj = activeSubject();
     subj.materials.push(makeMaterial(title, "text", text));
+    markSummaryStaleOrRegen(subj);
     showToast("Material added.");
     closePasteModal();
     renderAll();
@@ -1021,12 +1267,26 @@ function wireGlobalEvents(){
   document.getElementById("quizSetupOverlay").addEventListener("click", (e) => {
     if(e.target.id === "quizSetupOverlay") closeQuizSetupModal();
   });
-  document.getElementById("quizSetupConfirm").addEventListener("click", () => {
+  document.getElementById("quizSetupConfirm").addEventListener("click", async () => {
     const subj = activeSubject();
     const count = parseInt(document.getElementById("quizCountInput").value, 10);
-    const questions = generateQuiz(subj, count, quizSetupDifficulty);
+    const difficulty = quizSetupDifficulty;
+    const confirmBtn = document.getElementById("quizSetupConfirm");
+    const cancelBtn = document.getElementById("quizSetupCancel");
+    const originalLabel = confirmBtn.textContent;
+
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    confirmBtn.textContent = "Generating…";
+
+    const questions = await buildQuizQuestions(subj, count, difficulty);
+
+    confirmBtn.disabled = false;
+    cancelBtn.disabled = false;
+    confirmBtn.textContent = originalLabel;
+
     state.currentQuiz = {
-      subjectId: subj.id, difficulty: quizSetupDifficulty,
+      subjectId: subj.id, difficulty,
       questions, answers: {}, currentIndex: 0, finished: false
     };
     closeQuizSetupModal();
@@ -1037,6 +1297,100 @@ function wireGlobalEvents(){
   document.getElementById("menuBtn").addEventListener("click", openMobileSidebar);
   document.getElementById("sidebarClose").addEventListener("click", closeMobileSidebar);
   document.getElementById("sidebarScrim").addEventListener("click", closeMobileSidebar);
+
+  // Local AI modal
+  document.getElementById("openLocalAIModal").addEventListener("click", () => {
+    refreshLocalAIModalUI();
+    document.getElementById("localAIModalOverlay").classList.add("open");
+  });
+  document.getElementById("localAIModalClose").addEventListener("click", () => {
+    document.getElementById("localAIModalOverlay").classList.remove("open");
+  });
+  document.getElementById("localAIModalOverlay").addEventListener("click", (e) => {
+    if(e.target.id === "localAIModalOverlay") document.getElementById("localAIModalOverlay").classList.remove("open");
+  });
+  document.getElementById("useLocalAIToggle").addEventListener("change", (e) => {
+    setUseLocalAI(e.target.checked);
+  });
+  document.getElementById("localAIEnableBtn").addEventListener("click", async () => {
+    if(!window.LocalAI || !window.LocalAI.supported) return;
+    refreshLocalAIModalUI();
+    try{
+      await window.LocalAI.enable();
+      setUseLocalAI(true);
+      showToast("On-device AI is ready.");
+    }catch(err){
+      console.warn("Could not enable local AI:", err);
+      showToast("Couldn't enable on-device AI on this device.");
+    }
+    refreshLocalAIModalUI();
+  });
+  if(window.LocalAI){
+    window.LocalAI.onProgress(() => refreshLocalAIModalUI());
+  }
+
+  // Backup & restore modal
+  document.getElementById("openBackupModal").addEventListener("click", () => {
+    document.getElementById("backupModalOverlay").classList.add("open");
+  });
+  document.getElementById("backupModalClose").addEventListener("click", () => {
+    document.getElementById("backupModalOverlay").classList.remove("open");
+  });
+  document.getElementById("backupModalOverlay").addEventListener("click", (e) => {
+    if(e.target.id === "backupModalOverlay") document.getElementById("backupModalOverlay").classList.remove("open");
+  });
+  document.getElementById("exportBackupBtn").addEventListener("click", exportBackup);
+  document.getElementById("importBackupBtn").addEventListener("click", () => {
+    document.getElementById("importBackupInput").click();
+  });
+  document.getElementById("importBackupInput").addEventListener("change", (e) => {
+    if(e.target.files && e.target.files[0]) importBackupFile(e.target.files[0]);
+    e.target.value = "";
+  });
+}
+
+function refreshLocalAIModalUI(){
+  const statusText = document.getElementById("localAIStatusText");
+  const progressWrap = document.getElementById("localAIProgressWrap");
+  const progressFill = document.getElementById("localAIProgressFill");
+  const enableBtn = document.getElementById("localAIEnableBtn");
+  const toggle = document.getElementById("useLocalAIToggle");
+  const LA = window.LocalAI;
+
+  if(!LA || !LA.supported){
+    statusText.textContent = "Your browser doesn't support WebGPU, so on-device AI isn't available here. Try a recent Chrome or Edge on desktop, or Chrome on a newer Android phone.";
+    enableBtn.disabled = true;
+    toggle.disabled = true;
+    toggle.checked = false;
+    progressWrap.style.display = "none";
+    return;
+  }
+
+  toggle.checked = useLocalAI();
+  toggle.disabled = LA.status !== "ready";
+
+  if(LA.status === "idle"){
+    statusText.textContent = `Runs a small language model (${LA.modelId}) entirely on this device — no server, no account. First-time setup downloads roughly 700MB–1GB, cached afterward so it works fully offline from then on.`;
+    enableBtn.disabled = false;
+    enableBtn.textContent = "Download & enable";
+    progressWrap.style.display = "none";
+  } else if(LA.status === "loading"){
+    statusText.textContent = LA.progressText || "Downloading model…";
+    enableBtn.disabled = true;
+    enableBtn.textContent = "Downloading…";
+    progressWrap.style.display = "block";
+    progressFill.style.width = LA.progress + "%";
+  } else if(LA.status === "ready"){
+    statusText.textContent = "Ready — runs fully on this device and works offline from now on.";
+    enableBtn.disabled = true;
+    enableBtn.textContent = "Enabled";
+    progressWrap.style.display = "none";
+  } else if(LA.status === "error"){
+    statusText.textContent = "Couldn't start the on-device model. Your device or browser may not have enough GPU memory, or the download was interrupted.";
+    enableBtn.disabled = false;
+    enableBtn.textContent = "Try again";
+    progressWrap.style.display = "none";
+  }
 }
 
 function openMobileSidebar(){
