@@ -45,6 +45,8 @@
       <span class="plus">+</span> Create subject
     </button>
 
+    <button class="local-ai-btn" id="openLocalAIModal">🧠 On-device AI</button>
+
     <div class="sidebar-footer">
       <p>Data lives only in this browser.<br>No account, no server.</p>
     </div>
@@ -129,11 +131,31 @@
   </div>
 </div>
 
+<!-- ============ MODAL: On-device AI settings ============ -->
+<div class="modal-overlay" id="localAIModalOverlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2>On-device AI</h2>
+    <p class="modal-sub" id="localAIStatusText">Checking your browser…</p>
+    <div class="progress-track" id="localAIProgressWrap" style="display:none;margin-bottom:16px;">
+      <div class="progress-fill" id="localAIProgressFill" style="width:0%"></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13.5px;margin-top:4px;cursor:pointer;">
+      <input type="checkbox" id="useLocalAIToggle"> Use on-device AI for summaries &amp; quizzes
+    </label>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="localAIModalClose">Close</button>
+      <button class="btn btn-primary" id="localAIEnableBtn">Download &amp; enable</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <!-- Client-side text extraction for uploaded PDF / DOCX files -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<!-- On-device AI (WebLLM) — module script, runs before script.js needs it -->
+<script type="module" src="local-ai.js"></script>
 <script src="script.js"></script>
 <script>
   // Register the service worker so the app shell is cached for offline use.
