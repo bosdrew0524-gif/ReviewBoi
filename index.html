@@ -46,6 +46,7 @@
     </button>
 
     <button class="local-ai-btn" id="openLocalAIModal">🧠 On-device AI</button>
+    <button class="local-ai-btn" id="openBackupModal" style="margin-top:8px;">💾 Backup &amp; restore</button>
 
     <div class="sidebar-footer">
       <p>Data lives only in this browser.<br>No account, no server.</p>
@@ -145,6 +146,20 @@
     <div class="modal-actions">
       <button class="btn btn-ghost" id="localAIModalClose">Close</button>
       <button class="btn btn-primary" id="localAIEnableBtn">Download &amp; enable</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Backup & restore ============ -->
+<div class="modal-overlay" id="backupModalOverlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2>Backup &amp; restore</h2>
+    <p class="modal-sub">Everything lives only in this browser. Download a backup so you don't lose it if you clear browsing data, reinstall, or switch devices.</p>
+    <button class="btn btn-primary" id="exportBackupBtn" style="width:100%;margin-bottom:10px;justify-content:center;">⬇ Download backup (.json)</button>
+    <button class="btn btn-outline" id="importBackupBtn" style="width:100%;justify-content:center;">⬆ Restore from backup file</button>
+    <input type="file" id="importBackupInput" accept=".json,application/json" style="display:none">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="backupModalClose">Close</button>
     </div>
   </div>
 </div>
