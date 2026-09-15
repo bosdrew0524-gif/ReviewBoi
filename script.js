@@ -1707,7 +1707,9 @@ function refreshLocalAIModalUI(){
     enableBtn.textContent = "Enabled";
     progressWrap.style.display = "none";
   } else if(LA.status === "error"){
-    statusText.textContent = "Couldn't start the on-device model. Your device or browser may not have enough GPU memory, or the download was interrupted.";
+    statusText.textContent = LA.lastError
+      ? `Couldn't start the on-device model: ${LA.lastError}`
+      : "Couldn't start the on-device model. Your device or browser may not have enough GPU memory, or the download was interrupted.";
     enableBtn.disabled = false;
     enableBtn.textContent = "Try again";
     progressWrap.style.display = "none";
