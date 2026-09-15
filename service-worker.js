@@ -5,7 +5,7 @@
    so returning users get the update instead of a stale cache.
    ============================================================ */
 
-const CACHE_NAME = "studydesk-cache-v5";
+const CACHE_NAME = "studydesk-cache-v6";
 
 const APP_SHELL = [
   "./",
@@ -13,6 +13,7 @@ const APP_SHELL = [
   "./style.css",
   "./script.js",
   "./local-ai.js",
+  "./knowledge-pipeline.js",
   "./manifest.json",
   "./icon-192.png",
   "./icon-512.png",
