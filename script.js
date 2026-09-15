@@ -451,8 +451,56 @@ async function triggerSummaryGeneration(subj){
   renderAll(); renderSubjectPage();
 }
 
+// Builds quiz questions from the analyzed knowledge base (definitions +
+// key concepts, each with a source), in the same fill-in-the-blank /
+// "what term does this describe" style as the corpus-based mock.
+function buildQuizFromKB(kbRecords, count, difficulty){
+  const analyses = kbRecords.flatMap(r => r.analyses || []);
+  const pool = [];
+  analyses.forEach(a => {
+    (a.definitions || []).forEach(d => {
+      if(d && d.term && d.def) pool.push({ term: d.term, def: d.def, source: a.source });
+    });
+  });
+  if(pool.length < 2) return null;
+
+  const terms = pool.map(p => capitalize(p.term));
+  const questions = shuffle(pool).slice(0, count).map(p => {
+    const otherTerms = terms.filter(t => t.toLowerCase() !== p.term.toLowerCase());
+    const distractors = shuffle(otherTerms).slice(0,3);
+    while(distractors.length < 3) distractors.push(capitalize(p.term) + " (related)");
+    const options = shuffle([capitalize(p.term), ...distractors]);
+    return {
+      id: uid(),
+      question: `Which term fills in the blank: "${p.def.replace(new RegExp(`\\b${p.term}\\w*\\b`,"gi"), "_____")}"`,
+      options,
+      correctIndex: options.indexOf(capitalize(p.term)),
+      explanation: `From your analyzed materials (${p.source.material}${p.source.section ? " → " + p.source.section : ""}): ${p.def}`,
+      difficulty
+    };
+  });
+  return questions.length ? questions : null;
+}
+
 async function buildQuizQuestions(subj, count, difficulty){
   const corpus = getSubjectCorpus(subj);
+
+  // Prefer the analyzed knowledge base when it exists — better grounded,
+  // source-linked, and doesn't need another AI call at all.
+  if(window.KnowledgePipeline){
+    try{
+      const materialIds = subj.materials.filter(m => m.text).map(m => m.id);
+      const records = await window.KnowledgePipeline.kb.getMany(materialIds);
+      const analyzed = records.filter(r => r && r.analyses && r.analyses.length);
+      if(analyzed.length){
+        const kbQuestions = buildQuizFromKB(analyzed, count, difficulty);
+        if(kbQuestions) return kbQuestions;
+      }
+    }catch(err){
+      console.warn("Could not build quiz from knowledge base, falling back:", err);
+    }
+  }
+
   const usingLocal = useLocalAI() && window.LocalAI && window.LocalAI.supported && corpus.trim().length >= 40;
 
   if(usingLocal){
@@ -711,31 +759,138 @@ function renderMaterialsPanel(subj){
     } else if(m.status === "error"){
       metaLine = `${m.type.toUpperCase()} · couldn't extract text — try pasting it instead`;
     } else if(m.status === "empty"){
-      metaLine = `${m.type.toUpperCase()} · added ${timeAgo(m.addedAt)} · no readable text found (likely a scanned/image file)`;
+      metaLine = `${m.type.toUpperCase()} · added ${timeAgo(m.addedAt)} · no readable text found (likely a scanned/image file — OCR would be needed, which this app doesn't do)`;
     } else {
       metaLine = `${m.type.toUpperCase()} · added ${timeAgo(m.addedAt)} · ${m.text.length} characters`;
     }
     const warn = (m.status === "error" || m.status === "empty");
     return `
     <div class="material-card">
-      <div class="material-icon">${m.status === "processing" ? "⏳" : icons[m.type] || "📄"}</div>
-      <div class="material-info">
-        <div class="m-name">${escapeHtml(m.title)}</div>
-        <div class="m-meta" style="${warn ? 'color:var(--red)':''}">${metaLine}</div>
+      <div class="material-card-top">
+        <div class="material-icon">${m.status === "processing" ? "⏳" : icons[m.type] || "📄"}</div>
+        <div class="material-info">
+          <div class="m-name">${escapeHtml(m.title)}</div>
+          <div class="m-meta" style="${warn ? 'color:var(--red)':''}">${metaLine}</div>
+        </div>
+        <button class="icon-btn" data-id="${m.id}" title="Delete material">🗑</button>
       </div>
-      <button class="icon-btn" data-id="${m.id}" title="Delete material">🗑</button>
+      <div class="kb-row" id="kb-row-${m.id}">
+        ${m.text ? `<div class="kb-status">Checking analysis status…</div>` : ""}
+      </div>
     </div>
   `;
   }).join("");
   list.querySelectorAll(".icon-btn").forEach(btn => {
     btn.addEventListener("click", () => {
-      subj.materials = subj.materials.filter(m => m.id !== btn.dataset.id);
+      const removedId = btn.dataset.id;
+      subj.materials = subj.materials.filter(m => m.id !== removedId);
       markSummaryStaleOrRegen(subj);
+      if(window.KnowledgePipeline) window.KnowledgePipeline.kb.delete(removedId).catch(()=>{});
+      delete kbStatusCache[removedId];
       showToast("Material removed.");
       renderAll();
       renderSubjectPage();
     });
   });
+
+  refreshMaterialKbStatuses(subj);
+}
+
+/* ---- Analyze Material (knowledge pipeline) ---- */
+function kbStatusRowHTML(material, rec){
+  if(!material.text) return "";
+  const previewBtn = `<button class="btn btn-ghost btn-sm preview-btn" data-id="${material.id}">👁 Preview text</button>`;
+  const previewBlock = `<pre class="text-preview" id="preview-${material.id}" style="display:none;">${escapeHtml(material.text.slice(0, 4000))}${material.text.length > 4000 ? "\n\n… (truncated preview, full text is used for analysis)" : ""}</pre>`;
+
+  if(!rec){
+    return `<div class="kb-status"><button class="btn btn-outline btn-sm analyze-btn" data-id="${material.id}">🔬 Analyze material</button>${previewBtn}</div>${previewBlock}`;
+  }
+  if(rec.status === "complete"){
+    const sectionCount = new Set((rec.analyses||[]).map(a=>a.section)).size;
+    const conceptCount = (rec.analyses||[]).reduce((n,a)=> n + (a.key_concepts||[]).length + (a.definitions||[]).length, 0);
+    return `
+      <div class="kb-status kb-done">
+        <span>✓ Analyzed — ${sectionCount} section(s), ~${conceptCount} concepts</span>
+        <button class="btn btn-ghost btn-sm analyze-btn" data-id="${material.id}" data-force="1">Re-analyze</button>
+        ${previewBtn}
+      </div>${previewBlock}`;
+  }
+  if(rec.status === "analyzing" || rec.status === "partial"){
+    return `
+      <div class="kb-status">
+        <span>⏸ Partially analyzed (${rec.completedCount}/${rec.totalCount})</span>
+        <button class="btn btn-primary btn-sm analyze-btn" data-id="${material.id}">Resume analysis</button>
+        ${previewBtn}
+      </div>${previewBlock}`;
+  }
+  return `<div class="kb-status"><button class="btn btn-outline btn-sm analyze-btn" data-id="${material.id}">🔬 Analyze material</button>${previewBtn}</div>${previewBlock}`;
+}
+
+function analyzingRowHTML(completed, total, label){
+  const pct = total ? Math.round((completed/total)*100) : 0;
+  return `
+    <div class="kb-status kb-analyzing">
+      <div>${escapeHtml(label || "Analyzing…")} — ${completed}/${total}</div>
+      <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+    </div>`;
+}
+
+function wireAnalyzeButton(subj, material){
+  const row = document.getElementById(`kb-row-${material.id}`);
+  if(!row) return;
+  const btn = row.querySelector(".analyze-btn");
+  if(btn) btn.addEventListener("click", () => startAnalyzeMaterial(subj, material, btn.dataset.force === "1"));
+  const pbtn = row.querySelector(".preview-btn");
+  if(pbtn) pbtn.addEventListener("click", () => {
+    const pre = document.getElementById(`preview-${material.id}`);
+    if(pre) pre.style.display = pre.style.display === "none" ? "block" : "none";
+  });
+}
+
+async function refreshMaterialKbStatuses(subj){
+  if(!window.KnowledgePipeline) return;
+  for(const m of subj.materials){
+    if(!m.text) continue;
+    try{
+      const rec = kbStatusCache[m.id] !== undefined ? kbStatusCache[m.id] : await window.KnowledgePipeline.kb.get(m.id);
+      kbStatusCache[m.id] = rec;
+      const row = document.getElementById(`kb-row-${m.id}`);
+      if(row){
+        row.innerHTML = kbStatusRowHTML(m, rec);
+        wireAnalyzeButton(subj, m);
+      }
+    }catch(err){
+      console.warn("Could not read knowledge base status for", m.id, err);
+    }
+  }
+}
+
+async function startAnalyzeMaterial(subj, material, forceReanalyze){
+  const row = document.getElementById(`kb-row-${material.id}`);
+  const useLA = useLocalAI() && window.LocalAI && window.LocalAI.supported;
+  if(row) row.innerHTML = analyzingRowHTML(0, 1, "Starting…");
+
+  try{
+    const rec = await window.KnowledgePipeline.analyzeMaterial(material, {
+      useLocalAI: useLA,
+      forceReanalyze: !!forceReanalyze,
+      onProgress: (completed, total, label) => {
+        const r = document.getElementById(`kb-row-${material.id}`);
+        if(r) r.innerHTML = analyzingRowHTML(completed, total, label);
+      }
+    });
+    kbStatusCache[material.id] = rec;
+    showToast(rec.status === "complete" ? `Analyzed "${material.title}"` : `Paused — analyzed ${rec.completedCount}/${rec.totalCount} sections`);
+  }catch(err){
+    console.warn("Analysis failed:", err);
+    showToast(`Couldn't analyze "${material.title}".`);
+  }
+
+  const r = document.getElementById(`kb-row-${material.id}`);
+  if(r){
+    r.innerHTML = kbStatusRowHTML(material, kbStatusCache[material.id]);
+    wireAnalyzeButton(subj, material);
+  }
 }
 
 function handleFiles(fileList, subj){
@@ -790,22 +945,115 @@ function handleFiles(fileList, subj){
 }
 
 /* ---- Summary panel ---- */
+/* ---- Summary panel (AI-analysis-backed, with legacy fallback) ---- */
+let reviewerModeBySubject = {};
+const kbStatusCache = {};
+
 function renderSummaryPanel(subj){
   const panel = document.getElementById("panel-summary");
   const corpus = getSubjectCorpus(subj);
-
   if(!corpus){
     panel.innerHTML = `<div class="empty-state"><h3>Nothing to summarize yet</h3><p>Add a study material with extracted text to generate a summary.</p></div>`;
     return;
   }
 
+  const materialIds = subj.materials.filter(m => m.text).map(m => m.id);
+  panel.innerHTML = `<div class="empty-state"><h3>Loading…</h3><p>Checking for analyzed materials.</p></div>`;
+
+  window.KnowledgePipeline.kb.getMany(materialIds).then(records => {
+    const analyzed = records.filter(r => r && r.analyses && r.analyses.length);
+    if(analyzed.length === 0){
+      renderLegacySummaryPanel(subj);
+      return;
+    }
+    const mode = reviewerModeBySubject[subj.id] || "standard";
+    const reviewer = window.KnowledgePipeline.buildReviewerFromKB(analyzed, mode);
+    renderKBSummary(panel, subj, reviewer, mode);
+  }).catch(err => {
+    console.warn("Knowledge base unavailable, falling back to quick-scan:", err);
+    renderLegacySummaryPanel(subj);
+  });
+}
+
+function sourceTag(item){
+  if(!item || !item.source) return "";
+  const s = item.source;
+  return `<div class="src-tag">Source: ${escapeHtml(s.material)}${s.section ? " → " + escapeHtml(s.section) : ""}</div>`;
+}
+function uncertainBadge(item){
+  return item && item.uncertain ? `<span class="badge-wrong" style="margin-left:6px;">⚠ uncertain</span>` : "";
+}
+
+function renderKBSummary(panel, subj, reviewer, mode){
+  const modes = [
+    ["quick","Quick"], ["standard","Standard"], ["detailed","Detailed"], ["examCram","Exam Cram"]
+  ];
+  panel.innerHTML = `
+    <div class="notice-banner">
+      <span>⚡ Built from your analyzed materials' knowledge base — no re-processing needed.</span>
+    </div>
+    <div class="segmented" style="max-width:480px;margin-bottom:18px;">
+      ${modes.map(([id,label]) => `<button class="seg-btn ${mode===id?'active':''}" data-mode="${id}">${label}</button>`).join("")}
+    </div>
+    <div class="ai-grid">
+      <div class="ai-card" style="grid-column:1/-1;">
+        <h3><span class="tag-icon" style="background:var(--teal-tint);color:var(--teal-dark)">📄</span>Overview</h3>
+        <p>${escapeHtml(reviewer.overview)}</p>
+      </div>
+      ${reviewer.keyConcepts.length ? `
+      <div class="ai-card">
+        <h3><span class="tag-icon" style="background:var(--teal-tint);color:var(--teal-dark)">#</span>Key concepts</h3>
+        <div>${reviewer.keyConcepts.map(c => `<span class="keyword-chip">${escapeHtml(capitalize(c.text))}${uncertainBadge(c)}</span>`).join("")}</div>
+      </div>` : ""}
+      ${reviewer.definitions.length ? `
+      <div class="ai-card">
+        <h3><span class="tag-icon" style="background:var(--amber-tint);color:var(--amber-dark)">Aa</span>Definitions</h3>
+        ${reviewer.definitions.map(d => `<div class="def-item"><b>${escapeHtml(d.term)}:</b> ${escapeHtml(d.text)}${uncertainBadge(d)}${sourceTag(d)}</div>`).join("")}
+      </div>` : ""}
+      ${reviewer.importantFacts.length ? `
+      <div class="ai-card">
+        <h3><span class="tag-icon" style="background:var(--teal-tint);color:var(--teal-dark)">★</span>Important facts</h3>
+        <ul>${reviewer.importantFacts.map(f => `<li>${escapeHtml(f.text)}${uncertainBadge(f)}${sourceTag(f)}</li>`).join("")}</ul>
+      </div>` : ""}
+      ${reviewer.examples.length ? `
+      <div class="ai-card">
+        <h3><span class="tag-icon" style="background:var(--amber-tint);color:var(--amber-dark)">💡</span>Examples</h3>
+        <ul>${reviewer.examples.map(e => `<li>${escapeHtml(e.text)}${sourceTag(e)}</li>`).join("")}</ul>
+      </div>` : ""}
+      ${reviewer.comparisons.length ? `
+      <div class="ai-card">
+        <h3><span class="tag-icon" style="background:var(--teal-tint);color:var(--teal-dark)">⇄</span>Comparisons</h3>
+        <ul>${reviewer.comparisons.map(c => `<li>${escapeHtml(c.text)}${sourceTag(c)}</li>`).join("")}</ul>
+      </div>` : ""}
+      ${reviewer.processes.length ? `
+      <div class="ai-card">
+        <h3><span class="tag-icon" style="background:var(--amber-tint);color:var(--amber-dark)">▶</span>Processes</h3>
+        <ol>${reviewer.processes.map(p => `<li>${escapeHtml(p.text)}${sourceTag(p)}</li>`).join("")}</ol>
+      </div>` : ""}
+      ${reviewer.quickReview.length ? `
+      <div class="ai-card" style="grid-column:1/-1;">
+        <h3><span class="tag-icon" style="background:var(--teal-tint);color:var(--teal-dark)">✓</span>Quick review — must remember</h3>
+        <ul>${reviewer.quickReview.map(q => `<li>${escapeHtml(q.text)}${uncertainBadge(q)}</li>`).join("")}</ul>
+      </div>` : ""}
+    </div>
+  `;
+  panel.querySelectorAll(".seg-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      reviewerModeBySubject[subj.id] = btn.dataset.mode;
+      renderSummaryPanel(subj);
+    });
+  });
+}
+
+function renderLegacySummaryPanel(subj){
+  const panel = document.getElementById("panel-summary");
   const data = subj.aiSummary;
   if(!data){
     panel.innerHTML = `
       <div class="empty-state">
         <h3>No summary yet</h3>
-        <p>Generate a summary, key points, keywords, and definitions from this subject's materials.</p>
-        <button class="btn btn-primary" id="genSummaryBtn">Generate summary</button>
+        <p>For best results, analyze this subject's materials from the Study materials tab first. Or generate a quick summary right away:</p>
+        <button class="btn btn-primary" id="genSummaryBtn">Generate quick summary</button>
       </div>`;
     document.getElementById("genSummaryBtn").addEventListener("click", () => triggerSummaryGeneration(subj));
     return;
@@ -815,7 +1063,7 @@ function renderSummaryPanel(subj){
   const staleNote = data.stale ? " — new material added since this was generated" : "";
   panel.innerHTML = `
     <div class="notice-banner" style="${data.stale ? 'background:var(--red-tint);border-color:#EFC6BB;color:var(--red);':''}">
-      <span>${sourceLabel}${staleNote}</span>
+      <span>${sourceLabel}${staleNote} · Tip: analyze materials in the Study materials tab for deeper, source-linked results.</span>
       <button class="btn btn-ghost btn-sm" id="regenSummaryBtn" style="margin-left:auto;">Regenerate</button>
     </div>
     <div class="ai-grid">
@@ -840,7 +1088,7 @@ function renderSummaryPanel(subj){
   document.getElementById("regenSummaryBtn").addEventListener("click", () => triggerSummaryGeneration(subj));
 }
 
-/* ---- Reviewer panel ---- */
+/* ---- Reviewer panel (long-form, AI-analysis-backed with legacy fallback) ---- */
 function renderReviewerPanel(subj){
   const panel = document.getElementById("panel-reviewer");
   const corpus = getSubjectCorpus(subj);
@@ -848,6 +1096,44 @@ function renderReviewerPanel(subj){
     panel.innerHTML = `<div class="empty-state"><h3>No reviewer notes yet</h3><p>Add study materials first so notes can be generated.</p></div>`;
     return;
   }
+
+  const materialIds = subj.materials.filter(m => m.text).map(m => m.id);
+  panel.innerHTML = `<div class="empty-state"><h3>Loading…</h3><p>Checking for analyzed materials.</p></div>`;
+
+  window.KnowledgePipeline.kb.getMany(materialIds).then(records => {
+    const analyzed = records.filter(r => r && r.analyses && r.analyses.length);
+    if(analyzed.length === 0){
+      renderLegacyReviewerPanel(subj);
+      return;
+    }
+    const mode = reviewerModeBySubject[subj.id] || "standard";
+    const reviewer = window.KnowledgePipeline.buildReviewerFromKB(analyzed, mode);
+    const lines = [];
+    reviewer.mainTopics.forEach(t => {
+      lines.push(`■ ${t.section} (${t.material})`);
+      t.concepts.forEach(c => lines.push(`   • ${capitalize(c)}`));
+    });
+    if(reviewer.processes.length){
+      lines.push("", "Processes:");
+      reviewer.processes.forEach((p,i) => lines.push(`  ${i+1}. ${p.text}`));
+    }
+    lines.push("", "Quick review:");
+    reviewer.quickReview.forEach((q,i) => lines.push(`  ${i+1}. ${q.text}${q.uncertain ? " (uncertain)" : ""}`));
+
+    panel.innerHTML = `
+      <div class="ai-card" style="max-width:720px">
+        <h3><span class="tag-icon" style="background:var(--teal-tint);color:var(--teal-dark)">📚</span>Study reviewer — ${mode}</h3>
+        <p style="white-space:pre-line">${escapeHtml(lines.join("\n"))}</p>
+      </div>
+    `;
+  }).catch(err => {
+    console.warn("Knowledge base unavailable, falling back to quick-scan:", err);
+    renderLegacyReviewerPanel(subj);
+  });
+}
+
+function renderLegacyReviewerPanel(subj){
+  const panel = document.getElementById("panel-reviewer");
   const data = subj.aiSummary;
   if(!data){
     panel.innerHTML = `
@@ -1084,14 +1370,23 @@ function closeDeleteModal(){
 }
 
 /* ---------------- Backup / restore ---------------- */
-function exportBackup(){
+async function exportBackup(){
+  showToast("Preparing backup…");
+  let kbRecords = [];
+  try{
+    if(window.KnowledgePipeline) kbRecords = await window.KnowledgePipeline.kb.exportAll();
+  }catch(err){
+    console.warn("Could not export knowledge base:", err);
+  }
+
   const payload = {
     app: "studydesk",
-    version: 1,
+    backupVersion: 2,   // v1 = subjects only; v2 adds the analyzed knowledge base
     exportedAt: Date.now(),
     subjects: state.subjects,
     activeSubjectId: state.activeSubjectId,
-    useLocalAI: useLocalAI()
+    useLocalAI: useLocalAI(),
+    knowledgeBase: kbRecords   // does NOT include the AI model itself, just extracted concepts
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -1108,7 +1403,7 @@ function exportBackup(){
 
 function importBackupFile(file){
   const reader = new FileReader();
-  reader.onload = () => {
+  reader.onload = async () => {
     let parsed;
     try{
       parsed = JSON.parse(String(reader.result));
@@ -1120,8 +1415,10 @@ function importBackupFile(file){
       showToast("That file doesn't look like a Studydesk backup.");
       return;
     }
+    const kbNote = Array.isArray(parsed.knowledgeBase) && parsed.knowledgeBase.length
+      ? ` and ${parsed.knowledgeBase.length} analyzed material(s)` : "";
     const ok = confirm(
-      `This will replace everything currently saved with ${parsed.subjects.length} subject(s) from the backup. This can't be undone. Continue?`
+      `This will replace everything currently saved with ${parsed.subjects.length} subject(s)${kbNote} from the backup. This can't be undone. Continue?`
     );
     if(!ok) return;
 
@@ -1133,6 +1430,17 @@ function importBackupFile(file){
     state.activeSubjectId = parsed.activeSubjectId || (state.subjects[0] && state.subjects[0].id) || null;
     state.activePage = "dashboard";
     if(typeof parsed.useLocalAI === "boolean") setUseLocalAI(parsed.useLocalAI);
+
+    // v1 backups have no knowledgeBase field — nothing to restore, old behavior preserved.
+    if(Array.isArray(parsed.knowledgeBase) && window.KnowledgePipeline){
+      try{
+        await window.KnowledgePipeline.kb.importAll(parsed.knowledgeBase);
+        Object.keys(kbStatusCache).forEach(k => delete kbStatusCache[k]);
+      }catch(err){
+        console.warn("Could not restore knowledge base:", err);
+        showToast("Subjects restored, but the analyzed knowledge base couldn't be restored.");
+      }
+    }
 
     document.getElementById("backupModalOverlay").classList.remove("open");
     showToast("Backup restored.");
@@ -1161,16 +1469,29 @@ function openQuizSetupModal(){
   const subj = activeSubject();
   const corpus = subj ? getSubjectCorpus(subj) : "";
   const notice = document.getElementById("quizCorpusNotice");
-  if(corpus.trim().length < 40){
-    notice.style.display = "block";
-    notice.style.color = "var(--amber-dark)";
-    notice.textContent = "No usable material text found yet, so this quiz will use general study-skill questions instead of ones from your notes. Add a .txt file, pasted text, or a PDF/DOCX with readable text to get subject-specific questions.";
-  } else {
-    notice.style.display = "block";
-    notice.style.color = "var(--ink-soft)";
-    const words = corpus.trim().split(/\s+/).length;
-    notice.textContent = `Drawing from about ${words} words of material across this subject.`;
-  }
+  notice.style.display = "block";
+  notice.style.color = "var(--ink-soft)";
+  notice.textContent = "Checking your analyzed materials…";
+
+  const materialIds = subj ? subj.materials.filter(m => m.text).map(m => m.id) : [];
+  const kbCheck = window.KnowledgePipeline ? window.KnowledgePipeline.kb.getMany(materialIds) : Promise.resolve([]);
+
+  kbCheck.then(records => {
+    const analyzed = records.filter(r => r && r.analyses && r.analyses.length);
+    const definitionCount = analyzed.flatMap(r => r.analyses).reduce((n,a)=>n+(a.definitions||[]).length, 0);
+    if(analyzed.length && definitionCount >= 2){
+      notice.style.color = "var(--teal-dark)";
+      notice.textContent = `Drawing from your analyzed knowledge base — ${definitionCount} extracted terms available.`;
+    } else if(corpus.trim().length < 40){
+      notice.style.color = "var(--amber-dark)";
+      notice.textContent = "No usable material text found yet, so this quiz will use general study-skill questions instead of ones from your notes. Add a .txt file, pasted text, or a PDF/DOCX with readable text — or analyze it in the Study materials tab — to get subject-specific questions.";
+    } else {
+      const words = corpus.trim().split(/\s+/).length;
+      notice.textContent = `Drawing from about ${words} words of material. Tip: analyzing this material first (Study materials tab) gives more accurate, source-linked questions.`;
+    }
+  }).catch(() => {
+    notice.textContent = corpus.trim().length >= 40 ? "Drawing from your uploaded material." : "No usable material text found yet — this quiz will use general study-skill questions.";
+  });
 
   document.getElementById("quizSetupOverlay").classList.add("open");
 }
