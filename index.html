@@ -171,6 +171,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <!-- On-device AI (WebLLM) — module script, runs before script.js needs it -->
 <script type="module" src="local-ai.js"></script>
+<!-- Knowledge pipeline: cleaning, section detection, chunking, IndexedDB KB -->
+<script src="knowledge-pipeline.js"></script>
 <script src="script.js"></script>
 <script>
   // Register the service worker so the app shell is cached for offline use.
