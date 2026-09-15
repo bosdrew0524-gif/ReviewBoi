@@ -1,6 +1,6 @@
 {
   "name": "Studydesk — AI Study Reviewer",
-  "short_name": "Studydesk",
+  "short_name": "RebyuwerKo",
   "description": "Create subjects, upload study materials, and generate summaries and quizzes — all saved locally on your device.",
   "start_url": "./index.html",
   "scope": "./",
