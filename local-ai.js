@@ -20,13 +20,22 @@ function supportsWebGPU(){
 }
 
 // navigator.gpu existing just means the API shape is present — it does NOT
-// mean there's a usable GPU behind it. Many Android/older-desktop GPUs expose
-// the API but have no compatible adapter, which is the actual common failure.
+// mean there's a usable GPU behind it. Some devices also only succeed with a
+// specific powerPreference hint, so try a few before concluding it's dead.
 async function checkAdapter(){
   if(!supportsWebGPU()) throw new Error("This browser doesn't expose the WebGPU API at all.");
-  const adapter = await navigator.gpu.requestAdapter().catch(() => null);
-  if(!adapter) throw new Error("WebGPU is present but no compatible GPU adapter was found on this device — the GPU driver likely doesn't support it yet.");
-  return adapter;
+  const attempts = [{}, { powerPreference: "low-power" }, { powerPreference: "high-performance" }];
+  let lastErr = null;
+  for(const opts of attempts){
+    try{
+      const adapter = await navigator.gpu.requestAdapter(opts);
+      if(adapter) return adapter;
+    }catch(err){
+      lastErr = err;
+    }
+  }
+  const detail = lastErr ? (lastErr.message || String(lastErr)) : "requestAdapter() returned null for every option tried.";
+  throw new Error(`No WebGPU adapter could be created, even though this browser reports WebGPU as hardware-accelerated overall. Detail: ${detail}`);
 }
 
 function notifyProgress(){
