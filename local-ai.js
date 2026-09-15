@@ -19,6 +19,16 @@ function supportsWebGPU(){
   return typeof navigator !== "undefined" && "gpu" in navigator;
 }
 
+// navigator.gpu existing just means the API shape is present — it does NOT
+// mean there's a usable GPU behind it. Many Android/older-desktop GPUs expose
+// the API but have no compatible adapter, which is the actual common failure.
+async function checkAdapter(){
+  if(!supportsWebGPU()) throw new Error("This browser doesn't expose the WebGPU API at all.");
+  const adapter = await navigator.gpu.requestAdapter().catch(() => null);
+  if(!adapter) throw new Error("WebGPU is present but no compatible GPU adapter was found on this device — the GPU driver likely doesn't support it yet.");
+  return adapter;
+}
+
 function notifyProgress(){
   progressListeners.forEach(fn => {
     try{ fn(window.LocalAI.progress, window.LocalAI.progressText); }
@@ -32,8 +42,10 @@ async function ensureEngine(){
 
   window.LocalAI.status = "loading";
   window.LocalAI.progress = 0;
+  window.LocalAI.lastError = "";
 
   engineLoadPromise = (async () => {
+    await checkAdapter();
     const webllm = await import("https://esm.run/@mlc-ai/web-llm");
     const newEngine = await webllm.CreateMLCEngine(MODEL_ID, {
       initProgressCallback: (report) => {
@@ -55,6 +67,7 @@ async function ensureEngine(){
   } catch(err){
     engineLoadPromise = null;
     window.LocalAI.status = "error";
+    window.LocalAI.lastError = (err && err.message) ? err.message : String(err);
     notifyProgress();
     throw err;
   }
@@ -180,12 +193,14 @@ window.LocalAI = {
   status: "idle",        // idle | loading | ready | error
   progress: 0,
   progressText: "",
+  lastError: "",
   modelId: MODEL_ID,
   onProgress(fn){ progressListeners.push(fn); },
   async enable(){
     if(!supportsWebGPU()){
       window.LocalAI.status = "error";
-      throw new Error("WebGPU isn't available in this browser.");
+      window.LocalAI.lastError = "This browser doesn't expose the WebGPU API at all.";
+      throw new Error(window.LocalAI.lastError);
     }
     await ensureEngine();
   },
